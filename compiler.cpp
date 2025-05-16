@@ -72,26 +72,8 @@ bool PointwiseCompiler::supported(const torch::jit::Node* node) {
     return false;
 }
 
-void PointwiseCompiler::run(torch::jit::Stack& stack) {
-    const at::ArrayRef<Value*>& graph_inputs = subgraph_->inputs();
-    const auto num_inputs = graph_inputs.size();
-
-    at::ArrayRef<IValue> inputs = last(stack, num_inputs);
-
-    CompleteArgumentSpec spec{false, ArrayRef<IValue>(inputs)};
-    if (cache_.find(spec) == ArrayRef<IValue>(inputs)) {
-        cache_[spec] = compile(inputs);
-    }
-    auto outputs = cache_[spec](inputs);
-
-    drop(stack, num_inputs);
-    for (auto& output: outputs) {
-        auto var = torch::autograd::make_variable(output.toTensor());
-        stack.push_back(IValue(var));
-    }
-}
-
 CompiledCode PointwiseCompiler::compile(at::ArrayRef<IValue>& inputs) {
+    // constraints of our compiler
     TORCH_CHECK(inputs.size(), "Need at least one input.");
     for (const auto& input: inputs) {
         TORCH_CHECK(input.isTensor(), "Compiler can only handle tensor inputs.");
@@ -102,16 +84,19 @@ CompiledCode PointwiseCompiler::compile(at::ArrayRef<IValue>& inputs) {
             input.toTensor().numel() == size,
             "Compiler can only handle pointwise operations without broadcasting.");
     }
+
+    // code generation utilities
     auto reg_manager = RegisterManager();
     asmjit::CodeHolder code;
     code.init(jit_runtime_.getCodeInfo());
+    asmjit::StringLoader asm_logger;
     code.setLogger(&asm_logger);
     asmjit::X86Assembler assembler(&code);
 
     const bool isWinOS = static_cast<bool>(ASMJIT_OS_WINDOWS);
     asmjit::X86Gp pointers = isWinOS? asmjit::x86::rcx : asmjit::x86::rdi;
 
-    for (int i = 0; i < inputs.size(); i++) {
+    for (auto i = 0; i < inputs.size(); i++) {
         auto reg = reg_manager.getFreeAddrReg();
         auto mem_ptr = asmjit::X86::ptr(pointers, i * sizeof(void*));
         reg_manager.mapReg(subgraph_->inputs()[i], reg);
@@ -146,7 +131,60 @@ CompiledCode PointwiseCompiler::compile(at::ArrayRef<IValue>& inputs) {
             reg_manager.getValueReg(output);
         )
     }
-    // CONTINUE FROM HERE
+    // store all the outputs values into memory
+    for (auto output: subgraph_->outputs()) {
+        assembler.movd(
+            asmjit::x86::ptr(reg_manager.getAddrReg(output), iter, 2);
+            reg_manager.getValueReg(output));
+    }
+    assembler.add(iter, 1);
+    assembler.cmp(iter, size);
+    assembler.jb(loop_label);
+
+    assembler.ret();
+    
+    void (*fn)(void**);
+    asmjit::Error err = jit_runtime_.add(&fn, &code);
+    TORCH_CHECK(!err, "Couldn't create function, asm:\n", std::string(asm_logger.getString()));
+
+    auto compiled_func = [this, fn, size](at::ArrayRef<IValue>& inputs) {
+        std::vector<void*> args;
+        for(auto input: inputs) {
+            TORCH_CHECK(inputs.isTensor());
+            TORCH_CHECK(inputs.toTensor().is_contiguous());
+            TORCH_CHECK(inputs.toTensor().device().is_cpu());
+            args.emplace_back(at::empty({size}));
+        }
+        std::vector<IValue> outputs;
+        for (auto output: subgraph_->outputs) {
+            outputs.emplace_back(at::empty({size}));
+        }
+        for (auto output: outputs) {
+            args.emplace_back(output.toTensor().data_ptr());
+        }
+        fn(args.data());
+        return outputs;
+    }
+    return compiled_func;
+}
+
+void PointwiseCompiler::run(torch::jit::Stack& stack) {
+    const at::ArrayRef<Value*>& graph_inputs = subgraph_->inputs();
+    const auto num_inputs = graph_inputs.size();
+
+    at::ArrayRef<IValue> inputs = last(stack, num_inputs);
+
+    CompleteArgumentSpec spec{false, ArrayRef<IValue>(inputs)};
+    if (cache_.find(spec) == ArrayRef<IValue>(inputs)) {
+        cache_[spec] = compile(inputs);
+    }
+    auto outputs = cache_[spec](inputs);
+
+    drop(stack, num_inputs);
+    for (auto& output: outputs) {
+        auto var = torch::autograd::make_variable(output.toTensor());
+        stack.push_back(IValue(var));
+    }
 }
 
 void PointwiseCompiler::emitOperation(
