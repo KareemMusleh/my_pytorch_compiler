@@ -5,7 +5,7 @@ namespace py = pybind11;
 #include <torch/csrc/jit/custom_operator.h>
 
 using namespace torch.jit;
-PYBIND_MODULE(pointwise_compiler, )
+PYBIND11_MODULE(pointwise_compiler, )
 const auto pointwise_compiler_symbol = Symbol::fromQualString("pw::CompilationGroup");
 
 RegisterPass pass([pointwise_compiler_symbol](std::shared_ptr<Graph>& g)) {
